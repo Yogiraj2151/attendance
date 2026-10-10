@@ -38,7 +38,28 @@ import streamlit as st
 from dotenv import load_dotenv
 from supabase import create_client
 
+from flask import Flask, render_template, jsonify
 
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+@app.route("/api/status")
+def status():
+    return jsonify({
+        "success": True,
+        "message": "AI Attendance System connected successfully!"
+    })
+
+if __name__ == "__main__":
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        debug=False,
+        use_reloader=False
+    )
 # =========================================================
 # PAGE CONFIG
 # =========================================================
@@ -1021,125 +1042,133 @@ def is_multiple_face(face):
 
 
 # =========================================================
-# SUPABASE FACE STORAGE HELPERS
-# =========================================================
-
-FACE_BUCKET = "student-faces"
-
-
-def upload_face_image(student_id, image, roll_no):
-    """Upload a full student photo to private Supabase Storage."""
-    try:
-        ok, encoded = cv2.imencode(".jpg", image)
-        if not ok:
-            return False, None, "Could not encode the face photo."
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        storage_path = f"{student_id}/{roll_no}_{timestamp}.jpg"
-
-        supabase.storage.from_(FACE_BUCKET).upload(
-            path=storage_path,
-            file=encoded.tobytes(),
-            file_options={
-                "content-type": "image/jpeg",
-                "upsert": "false",
-            },
-        )
-        return True, storage_path, None
-    except Exception as exc:
-        return False, None, str(exc)
-
-
-def download_face_image(storage_path):
-    """Download a face photo from Supabase Storage and decode it for OpenCV."""
-    try:
-        image_bytes = (
-            supabase.storage
-            .from_(FACE_BUCKET)
-            .download(storage_path)
-        )
-        if not image_bytes:
-            return None
-        buffer = np.frombuffer(image_bytes, dtype=np.uint8)
-        return cv2.imdecode(buffer, cv2.IMREAD_COLOR)
-    except Exception:
-        return None
-
-
-# =========================================================
 # CREATE LBPH MODEL
 # =========================================================
 
 def create_recognizer():
+
     try:
-        recognizer = cv2.face.LBPHFaceRecognizer_create()
+
+        recognizer = (
+            cv2.face
+            .LBPHFaceRecognizer_create()
+        )
+
     except AttributeError:
+
         return None, (
-            "❌ cv2.face available नाही. Install opencv-contrib-python-headless."
+            "❌ cv2.face available नाही.\n"
+            "Run: pip install opencv-contrib-python"
         )
 
     students = get_students()
+
     if students.empty:
-        return None, "❌ No students registered."
+
+        return None, (
+            "❌ No students registered."
+        )
 
     faces = []
+
     labels = []
+
     label_to_roll = {}
+
     label_id = 0
 
     for _, student in students.iterrows():
-        roll_no = str(student.get("roll_no", "")).strip()
+
+        roll_no = str(
+            student.get(
+                "roll_no",
+                ""
+            )
+        ).strip()
+
         if not roll_no:
+
             continue
 
-        candidate_images = []
+        image_path = None
 
-        # Prefer images saved in Supabase Storage.
-        paths = student.get("face_image_paths", [])
-        if isinstance(paths, str):
-            try:
-                import json
-                paths = json.loads(paths)
-            except Exception:
-                paths = []
-        if not isinstance(paths, list):
-            paths = []
+        for ext in [
+            ".jpg",
+            ".jpeg",
+            ".png"
+        ]:
 
-        for storage_path in paths:
-            if not storage_path:
-                continue
-            image = download_face_image(str(storage_path))
-            if image is not None:
-                candidate_images.append(image)
+            path = (
+                KNOWN_FACES_DIR
+                / f"{roll_no}{ext}"
+            )
 
-        # Backward compatibility: use the local cache if no Storage image is available.
-        if not candidate_images:
-            for ext in (".jpg", ".jpeg", ".png"):
-                path = KNOWN_FACES_DIR / f"{roll_no}{ext}"
-                if path.exists():
-                    image = cv2.imread(str(path))
-                    if image is not None:
-                        candidate_images.append(image)
-                    break
+            if path.exists():
 
-        for image in candidate_images:
-            face, _ = detect_single_face(image)
-            if face is None or is_multiple_face(face):
-                continue
+                image_path = path
 
-            faces.append(face)
-            labels.append(label_id)
-            label_to_roll[label_id] = roll_no
-            label_id += 1
+                break
 
-    if not faces:
-        return None, (
-            "❌ Supabase Storage/local मध्ये registered face images सापडल्या नाहीत. "
-            "Student Registration पुन्हा करून पाहा आणि student-faces bucket तपासा."
+        if image_path is None:
+
+            continue
+
+        image = cv2.imread(
+            str(image_path)
         )
 
-    recognizer.train(faces, np.array(labels, dtype=np.int32))
-    return (recognizer, label_to_roll), None
+        if image is None:
+
+            continue
+
+        face, box = detect_single_face(
+            image
+        )
+
+        # =================================================
+        # IMPORTANT FIX
+        # =================================================
+
+        if is_multiple_face(face):
+
+            continue
+
+        if face is None:
+
+            continue
+
+        # =================================================
+
+        faces.append(face)
+
+        labels.append(
+            label_id
+        )
+
+        label_to_roll[
+            label_id
+        ] = roll_no
+
+        label_id += 1
+
+    if not faces:
+
+        return None, (
+            "❌ Registered face images सापडल्या नाहीत."
+        )
+
+    recognizer.train(
+        faces,
+        np.array(
+            labels,
+            dtype=np.int32
+        )
+    )
+
+    return (
+        recognizer,
+        label_to_roll
+    ), None
 
 
 # =========================================================
@@ -1851,10 +1880,20 @@ def student_registration():
         (200, 200)
     )
 
-    # Keep a local cache for development; cloud recognition reads from Supabase Storage.
-    face_path = KNOWN_FACES_DIR / f"{roll_no}.jpg"
-    if not cv2.imwrite(str(face_path), image):
-        st.error("❌ Face image save failed.")
+    face_path = (
+        KNOWN_FACES_DIR
+        / f"{roll_no}.jpg"
+    )
+
+    if not cv2.imwrite(
+        str(face_path),
+        face_color
+    ):
+
+        st.error(
+            "❌ Face image save failed."
+        )
+
         return
 
     data = {
@@ -1882,6 +1921,7 @@ def student_registration():
     }
 
     try:
+
         response = (
             supabase
             .table("students")
@@ -1889,71 +1929,41 @@ def student_registration():
             .execute()
         )
 
-        if not response.data:
-            if face_path.exists():
-                face_path.unlink()
-            st.error("❌ Registration failed: database returned no student record.")
-            return
+        if response.data:
 
-        student_record = response.data[0]
-        student_id = student_record.get("id")
-        if student_id is None:
-            st.error(
-                "Student was added, but Supabase did not return an id. "
-                "Ensure students.id is a generated primary key."
-            )
-            return
-
-        uploaded, storage_path, upload_error = upload_face_image(
-            student_id=student_id,
-            image=image,
-            roll_no=roll_no,
-        )
-
-        if not uploaded:
-            try:
-                supabase.table("students").delete().eq("id", student_id).execute()
-            except Exception:
-                pass
-            if face_path.exists():
-                face_path.unlink()
-            st.error("❌ Face image upload to Supabase Storage failed.")
-            st.caption(upload_error or "Unknown Storage error")
-            st.info(
-                "Check that the 'student-faces' bucket exists and that your Supabase "
-                "key/policies allow Storage uploads."
-            )
-            return
-
-        update_result = (
-            supabase
-            .table("students")
-            .update({"face_image_paths": [storage_path]})
-            .eq("id", student_id)
-            .execute()
-        )
-
-        if not update_result.data:
-            st.warning(
-                "Student and photo uploaded, but face_image_paths could not be saved. "
-                "Check the students.face_image_paths JSONB column."
-            )
-            st.caption(f"Uploaded Storage path: {storage_path}")
-        else:
             st.success(
-                f"✅ {name} registered successfully. Face photo saved to Supabase Storage."
+                f"✅ {name} registered successfully!"
             )
 
-        st.image(
-            cv2.cvtColor(face_color, cv2.COLOR_BGR2RGB),
-            caption="Registered Face",
-            width=250,
-        )
+            st.image(
+                cv2.cvtColor(
+                    face_color,
+                    cv2.COLOR_BGR2RGB
+                ),
+                caption="Registered Face",
+                width=250
+            )
+
+        else:
+
+            if face_path.exists():
+
+                face_path.unlink()
+
+            st.error(
+                "❌ Registration failed."
+            )
 
     except Exception as e:
+
         if face_path.exists():
+
             face_path.unlink()
-        st.error("❌ Database registration / face upload failed.")
+
+        st.error(
+            "❌ Database registration failed."
+        )
+
         st.caption(str(e))
 
 
@@ -3346,144 +3356,155 @@ else:
 
     role = st.session_state.role
 
-    # =====================================================
-    # ADMIN
-    # =====================================================
 
-    if role == "admin":
+# =====================================================
+# ADMIN — NO SIDEBAR
+# =====================================================
 
-        st.sidebar.title(
-            "👨‍💼 Admin Panel"
-        )
+if role == "admin":
 
-        st.sidebar.success(
-            f"👤 {user.email}"
-        )
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(135deg, #240046, #3c096c);
+            padding: 22px;
+            border-radius: 18px;
+            border: 1px solid #e0aaff;
+            margin-bottom: 20px;
+        ">
+            <h2 style="color: #e0aaff; margin: 0;">
+                👨‍💼 Admin Panel
+            </h2>
+            <p style="color: #eccaff; margin: 8px 0 0;">
+                👤 {user.email}
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-        page = st.sidebar.radio(
-            "Navigation",
-            [
+    page = st.radio(
+        "Admin Navigation",
+        [
+            "📊 Admin Dashboard",
+            "👨‍🎓 Student Registration",
+            "📋 Student List",
+            "📷 Face Attendance",
+            "📊 Attendance Records",
+            "📅 Monthly Attendance",
+            "📝 Add Marks",
+            "📚 Marks Records",
+            "🏖️ Holiday Management"
+        ],
+        horizontal=True,
+        key="admin_navigation",
+        label_visibility="collapsed"
+    )
 
-                "📊 Admin Dashboard",
+    st.markdown("---")
 
-                "👨‍🎓 Student Registration",
+    if page == "📊 Admin Dashboard":
+        admin_dashboard()
 
-                "📋 Student List",
+    elif page == "👨‍🎓 Student Registration":
+        student_registration()
 
-                "📷 Face Attendance",
+    elif page == "📋 Student List":
+        student_list()
 
-                "📊 Attendance Records",
+    elif page == "📷 Face Attendance":
+        admin_face_attendance()
 
-                "📅 Monthly Attendance",
+    elif page == "📊 Attendance Records":
+        attendance_list()
 
-                "📝 Add Marks",
+    elif page == "📅 Monthly Attendance":
+        monthly_attendance()
 
-                "📚 Marks Records",
+    elif page == "📝 Add Marks":
+        add_marks()
 
-                "🏖️ Holiday Management"
-            ],
-            key="admin_navigation"
-        )
+    elif page == "📚 Marks Records":
+        marks_records()
 
-        st.sidebar.divider()
+    elif page == "🏖️ Holiday Management":
+        holiday_management()
 
-        if st.sidebar.button(
-            "🚪 Logout",
-            use_container_width=True,
-            key="admin_logout"
-        ):
+    st.markdown("---")
 
-            logout()
-
-        if page == "📊 Admin Dashboard":
-
-            admin_dashboard()
-
-        elif page == "👨‍🎓 Student Registration":
-
-            student_registration()
-
-        elif page == "📋 Student List":
-
-            student_list()
-
-        elif page == "📷 Face Attendance":
-
-            admin_face_attendance()
-
-        elif page == "📊 Attendance Records":
-
-            attendance_list()
-
-        elif page == "📅 Monthly Attendance":
-
-            monthly_attendance()
-
-        elif page == "📝 Add Marks":
-
-            add_marks()
-
-        elif page == "📚 Marks Records":
-
-            marks_records()
-
-        elif page == "🏖️ Holiday Management":
-
-            holiday_management()
-
-    # =====================================================
-    # STUDENT
-    # =====================================================
-
-    elif role == "student":
-
-        st.sidebar.title(
-            "👨‍🎓 Student Panel"
-        )
-
-        st.sidebar.success(
-            f"👤 {user.email}"
-        )
-
-        page = st.sidebar.radio(
-            "Navigation",
-            [
-
-                "📊 Student Dashboard",
-
-                "🏖️ Holidays",
-
-                "📷 Mark My Attendance"
-            ],
-            key="student_navigation"
-        )
-
-        st.sidebar.divider()
-
-        if st.sidebar.button(
-            "🚪 Logout",
-            use_container_width=True,
-            key="student_logout"
-        ):
-
-            logout()
-
-        if page == "📊 Student Dashboard":
-
-            student_dashboard()
-
-        elif page == "🏖️ Holidays":
-
-            student_holidays()
-
-        elif page == "📷 Mark My Attendance":
-
-            student_face_attendance()
-
-    else:
-
-        st.error(
-            "❌ Unauthorized role."
-        )
-
+    if st.button(
+        "🚪 Logout",
+        use_container_width=True,
+        key="admin_logout"
+    ):
         logout()
+
+
+# =====================================================
+# STUDENT — NO SIDEBAR
+# =====================================================
+
+elif role == "student":
+
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(135deg, #240046, #3c096c);
+            padding: 22px;
+            border-radius: 18px;
+            border: 1px solid #e0aaff;
+            margin-bottom: 20px;
+        ">
+            <h2 style="color: #e0aaff; margin: 0;">
+                👨‍🎓 Student Panel
+            </h2>
+            <p style="color: #eccaff; margin: 8px 0 0;">
+                👤 {user.email}
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    page = st.radio(
+        "Student Navigation",
+        [
+            "📊 Student Dashboard",
+            "🏖️ Holidays",
+            "📷 Mark My Attendance"
+        ],
+        horizontal=True,
+        key="student_navigation",
+        label_visibility="collapsed"
+    )
+
+    st.markdown("---")
+
+    if page == "📊 Student Dashboard":
+        student_dashboard()
+
+    elif page == "🏖️ Holidays":
+        student_holidays()
+
+    elif page == "📷 Mark My Attendance":
+        student_face_attendance()
+
+    st.markdown("---")
+
+    if st.button(
+        "🚪 Logout",
+        use_container_width=True,
+        key="student_logout"
+    ):
+        logout()
+
+
+# =====================================================
+# UNAUTHORIZED ROLE
+# =====================================================
+
+else:
+
+    st.error("❌ Unauthorized role.")
+    logout()
+
