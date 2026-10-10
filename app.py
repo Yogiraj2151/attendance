@@ -1,5 +1,4 @@
 
-
 # =========================================================
 # AI SMART ATTENDANCE MANAGEMENT SYSTEM
 # =========================================================
@@ -48,9 +47,9 @@ st.set_page_config(
     page_title="AI Smart Attendance",
     page_icon="🤖",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
-# ============================================================
+# =========================================================
 # 🚗 AI SMART ATTENDANCE — ANIMATED CAR + MOUSE PARTICLES
 # =========================================================
 # PREMIUM ANIMATED BACKGROUND
@@ -1022,133 +1021,125 @@ def is_multiple_face(face):
 
 
 # =========================================================
+# SUPABASE FACE STORAGE HELPERS
+# =========================================================
+
+FACE_BUCKET = "student-faces"
+
+
+def upload_face_image(student_id, image, roll_no):
+    """Upload a full student photo to private Supabase Storage."""
+    try:
+        ok, encoded = cv2.imencode(".jpg", image)
+        if not ok:
+            return False, None, "Could not encode the face photo."
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        storage_path = f"{student_id}/{roll_no}_{timestamp}.jpg"
+
+        supabase.storage.from_(FACE_BUCKET).upload(
+            path=storage_path,
+            file=encoded.tobytes(),
+            file_options={
+                "content-type": "image/jpeg",
+                "upsert": "false",
+            },
+        )
+        return True, storage_path, None
+    except Exception as exc:
+        return False, None, str(exc)
+
+
+def download_face_image(storage_path):
+    """Download a face photo from Supabase Storage and decode it for OpenCV."""
+    try:
+        image_bytes = (
+            supabase.storage
+            .from_(FACE_BUCKET)
+            .download(storage_path)
+        )
+        if not image_bytes:
+            return None
+        buffer = np.frombuffer(image_bytes, dtype=np.uint8)
+        return cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
+# =========================================================
 # CREATE LBPH MODEL
 # =========================================================
 
 def create_recognizer():
-
     try:
-
-        recognizer = (
-            cv2.face
-            .LBPHFaceRecognizer_create()
-        )
-
+        recognizer = cv2.face.LBPHFaceRecognizer_create()
     except AttributeError:
-
         return None, (
-            "❌ cv2.face available नाही.\n"
-            "Run: pip install opencv-contrib-python"
+            "❌ cv2.face available नाही. Install opencv-contrib-python-headless."
         )
 
     students = get_students()
-
     if students.empty:
-
-        return None, (
-            "❌ No students registered."
-        )
+        return None, "❌ No students registered."
 
     faces = []
-
     labels = []
-
     label_to_roll = {}
-
     label_id = 0
 
     for _, student in students.iterrows():
-
-        roll_no = str(
-            student.get(
-                "roll_no",
-                ""
-            )
-        ).strip()
-
+        roll_no = str(student.get("roll_no", "")).strip()
         if not roll_no:
-
             continue
 
-        image_path = None
+        candidate_images = []
 
-        for ext in [
-            ".jpg",
-            ".jpeg",
-            ".png"
-        ]:
+        # Prefer images saved in Supabase Storage.
+        paths = student.get("face_image_paths", [])
+        if isinstance(paths, str):
+            try:
+                import json
+                paths = json.loads(paths)
+            except Exception:
+                paths = []
+        if not isinstance(paths, list):
+            paths = []
 
-            path = (
-                KNOWN_FACES_DIR
-                / f"{roll_no}{ext}"
-            )
+        for storage_path in paths:
+            if not storage_path:
+                continue
+            image = download_face_image(str(storage_path))
+            if image is not None:
+                candidate_images.append(image)
 
-            if path.exists():
+        # Backward compatibility: use the local cache if no Storage image is available.
+        if not candidate_images:
+            for ext in (".jpg", ".jpeg", ".png"):
+                path = KNOWN_FACES_DIR / f"{roll_no}{ext}"
+                if path.exists():
+                    image = cv2.imread(str(path))
+                    if image is not None:
+                        candidate_images.append(image)
+                    break
 
-                image_path = path
+        for image in candidate_images:
+            face, _ = detect_single_face(image)
+            if face is None or is_multiple_face(face):
+                continue
 
-                break
-
-        if image_path is None:
-
-            continue
-
-        image = cv2.imread(
-            str(image_path)
-        )
-
-        if image is None:
-
-            continue
-
-        face, box = detect_single_face(
-            image
-        )
-
-        # =================================================
-        # IMPORTANT FIX
-        # =================================================
-
-        if is_multiple_face(face):
-
-            continue
-
-        if face is None:
-
-            continue
-
-        # =================================================
-
-        faces.append(face)
-
-        labels.append(
-            label_id
-        )
-
-        label_to_roll[
-            label_id
-        ] = roll_no
-
-        label_id += 1
+            faces.append(face)
+            labels.append(label_id)
+            label_to_roll[label_id] = roll_no
+            label_id += 1
 
     if not faces:
-
         return None, (
-            "❌ Registered face images सापडल्या नाहीत."
+            "❌ Supabase Storage/local मध्ये registered face images सापडल्या नाहीत. "
+            "Student Registration पुन्हा करून पाहा आणि student-faces bucket तपासा."
         )
 
-    recognizer.train(
-        faces,
-        np.array(
-            labels,
-            dtype=np.int32
-        )
-    )
-
-    return (
-        recognizer,
-        label_to_roll
-    ), None
+    recognizer.train(faces, np.array(labels, dtype=np.int32))
+    return (recognizer, label_to_roll), None
 
 
 # =========================================================
@@ -1860,20 +1851,10 @@ def student_registration():
         (200, 200)
     )
 
-    face_path = (
-        KNOWN_FACES_DIR
-        / f"{roll_no}.jpg"
-    )
-
-    if not cv2.imwrite(
-        str(face_path),
-        face_color
-    ):
-
-        st.error(
-            "❌ Face image save failed."
-        )
-
+    # Keep a local cache for development; cloud recognition reads from Supabase Storage.
+    face_path = KNOWN_FACES_DIR / f"{roll_no}.jpg"
+    if not cv2.imwrite(str(face_path), image):
+        st.error("❌ Face image save failed.")
         return
 
     data = {
@@ -1901,7 +1882,6 @@ def student_registration():
     }
 
     try:
-
         response = (
             supabase
             .table("students")
@@ -1909,41 +1889,71 @@ def student_registration():
             .execute()
         )
 
-        if response.data:
-
-            st.success(
-                f"✅ {name} registered successfully!"
-            )
-
-            st.image(
-                cv2.cvtColor(
-                    face_color,
-                    cv2.COLOR_BGR2RGB
-                ),
-                caption="Registered Face",
-                width=250
-            )
-
-        else:
-
+        if not response.data:
             if face_path.exists():
-
                 face_path.unlink()
+            st.error("❌ Registration failed: database returned no student record.")
+            return
 
+        student_record = response.data[0]
+        student_id = student_record.get("id")
+        if student_id is None:
             st.error(
-                "❌ Registration failed."
+                "Student was added, but Supabase did not return an id. "
+                "Ensure students.id is a generated primary key."
             )
+            return
 
-    except Exception as e:
-
-        if face_path.exists():
-
-            face_path.unlink()
-
-        st.error(
-            "❌ Database registration failed."
+        uploaded, storage_path, upload_error = upload_face_image(
+            student_id=student_id,
+            image=image,
+            roll_no=roll_no,
         )
 
+        if not uploaded:
+            try:
+                supabase.table("students").delete().eq("id", student_id).execute()
+            except Exception:
+                pass
+            if face_path.exists():
+                face_path.unlink()
+            st.error("❌ Face image upload to Supabase Storage failed.")
+            st.caption(upload_error or "Unknown Storage error")
+            st.info(
+                "Check that the 'student-faces' bucket exists and that your Supabase "
+                "key/policies allow Storage uploads."
+            )
+            return
+
+        update_result = (
+            supabase
+            .table("students")
+            .update({"face_image_paths": [storage_path]})
+            .eq("id", student_id)
+            .execute()
+        )
+
+        if not update_result.data:
+            st.warning(
+                "Student and photo uploaded, but face_image_paths could not be saved. "
+                "Check the students.face_image_paths JSONB column."
+            )
+            st.caption(f"Uploaded Storage path: {storage_path}")
+        else:
+            st.success(
+                f"✅ {name} registered successfully. Face photo saved to Supabase Storage."
+            )
+
+        st.image(
+            cv2.cvtColor(face_color, cv2.COLOR_BGR2RGB),
+            caption="Registered Face",
+            width=250,
+        )
+
+    except Exception as e:
+        if face_path.exists():
+            face_path.unlink()
+        st.error("❌ Database registration / face upload failed.")
         st.caption(str(e))
 
 
