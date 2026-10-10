@@ -1,7 +1,7 @@
 streamlit
+supabase
+python-dotenv
 opencv-contrib-python-headless
 numpy
 pandas
-supabase
-python-dotenv
-Pillow
+flask
